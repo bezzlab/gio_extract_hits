@@ -48,7 +48,7 @@ public class App{
         }else if(type.equals(MZQ)){
             parser = new ParseMzq(input, output);
         }else if(type.equals(MZID)){
-            parser = new ParseMzid(input, output,args[3]);
+            parser = new ParseMzid(input, output);
         }
         parser.parse();
     }

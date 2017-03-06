@@ -8,6 +8,7 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -36,110 +37,120 @@ public class ParseMzid extends Parser {
 
     private static final String SCORE = "Score";
     private final String MZID_XSD = "mzIdentML1.1.0.xsd";
-    private HashSet<Integer> cvTerms = new HashSet<Integer>();
+    private HashSet<Integer> cvTerms = new HashSet<Integer>();//the list of known CV terms, hard coded in initialize() method
     private HashSet<String> existingTerms = new HashSet<String>();
-    private HashMap<String, HashMap<String, String>> peptideCvTerms = new HashMap<String, HashMap<String, String>>();
-    private ArrayList<String> peptides = new ArrayList<String>();
-    private String fastaFile;
-    private HashMap<String, String> dbs_seqs = new HashMap<String, String>();
+//    private HashMap<String, HashMap<String, String>> peptideCvTerms = new HashMap<String, HashMap<String, String>>();
+//    private ArrayList<String> peptides = new ArrayList<String>();
+//    private String fastaFile;
+    private HashMap<String, String> accessions = new HashMap<String, String>();
+    private HashMap<String, String> peptideSeqs = new HashMap<String, String>();
+    private HashMap<String, String> pePeptide = new HashMap<String, String>();
+    private HashMap<String, String> peProtein = new HashMap<String, String>();
 
-    public ParseMzid(String input, String output, String fastaFile) {
+    public ParseMzid(String input, String output) {
         this.input = input;
         this.output = output;
-        this.fastaFile = fastaFile;
+//        this.fastaFile = fastaFile;
         initialize();
     }
 
     @Override
     void parse() {
         try {
-            Validator validator = XMLparser.getValidator(MZID_XSD);
-            boolean validFlag = XMLparser.validate(validator, input);
-            if (!validFlag) {
-                System.out.println("The mzIdentML validation went wrong, program terminated");
-                System.exit(1);
-            }
-            //main parse code is adapted from loadMzIdentML.java from X-Tracker
-            MzIdentMLUnmarshaller unmarshaller = new MzIdentMLUnmarshaller(new File(input));
-            Iterator<DBSequence> seqs = unmarshaller.unmarshalCollectionFromXpath(MzIdentMLElement.DBSequence);
-            while (seqs.hasNext()) {
-                DBSequence current = seqs.next();
-                String seq = current.getSeq();
-                if (seq != null) {
-                    dbs_seqs.put(current.getId(), seq);
+            File file = new File(input);
+            System.out.println("Start at "+LocalDateTime.now());
+            int mega = (int) (file.length()/1024/1024);
+            System.out.println("The input file has the size of "+mega+"M");
+            if(mega < 300){
+                Validator validator = XMLparser.getValidator(MZID_XSD);
+                boolean validFlag = XMLparser.validate(validator, input);
+                if (!validFlag) {
+                    System.out.println("The mzIdentML validation went wrong, program terminated");
+                    System.exit(1);
                 }
+                System.out.println("Validation successful " + LocalDateTime.now());
+            }else{
+                System.out.println("It will take too long to validate a file with this size, validation skipped");
             }
-            if(dbs_seqs.isEmpty()) System.out.println("No protein sequences can be found in the given mzid file: "+input);
-            BufferedWriter seqOut = new BufferedWriter(new FileWriter(fastaFile));
+//            System.exit(0);
+            //main parse code is adapted from loadMzIdentML.java from X-Tracker
+            MzIdentMLUnmarshaller unmarshaller = new MzIdentMLUnmarshaller(file);
+            //create the mapping between protein id (e.g. DBSeq107) and accession (e.g. P12345)
+            Iterator<DBSequence> dbs = unmarshaller.unmarshalCollectionFromXpath(MzIdentMLElement.DBSequence);
+            while (dbs.hasNext()) {
+                DBSequence current = dbs.next();
+//line 1387 <xsd:attribute name="accession" type="xsd:string" use="required">
+                accessions.put(current.getId(), current.getAccession());
+            }
+            System.out.println("Proteins extracted "+LocalDateTime.now());
+            Iterator<Peptide> iterPeptide = unmarshaller.unmarshalCollectionFromXpath(MzIdentMLElement.Peptide);
+            while (iterPeptide.hasNext()) {
+                Peptide peptide = iterPeptide.next();
+//line 1026 under PeptideType <xsd:element name="PeptideSequence" type="sequence">
+                peptideSeqs.put(peptide.getId(), peptide.getPeptideSequence());
+            }
+            System.out.println("Peptides extracted "+LocalDateTime.now());
+            Iterator<PeptideEvidence> pes = unmarshaller.unmarshalCollectionFromXpath(MzIdentMLElement.PeptideEvidence);
+            while(pes.hasNext()){
+                PeptideEvidence pe = pes.next();
+//line 1276	<xsd:attribute name="dBSequence_ref" type="xsd:string" use="required">
+//line 1281	<xsd:attribute name="peptide_ref" type="xsd:string" use="required">
+//line 1326	<xsd:attribute name="isDecoy" type="xsd:boolean" default="false">
+                //though it is optional the default is false
+                if(pe.isIsDecoy()) continue;
+                pePeptide.put(pe.getId(), pe.getPeptideRef());
+                peProtein.put(pe.getId(), pe.getDBSequenceRef());
+            }
+            System.out.println("PeptideEvidence(peptide-protein relationship) extracted "+LocalDateTime.now());
 
+            String mainScoreCV="";
+            ArrayList<String> remaining = new ArrayList<String>();
+            BufferedWriter out = new BufferedWriter(new FileWriter(output));
+//line 367  <xsd:element name="AnalysisData" type="psi-pi:AnalysisDataType"/>
             AnalysisData analysisData = unmarshaller.unmarshal(MzIdentMLElement.AnalysisData);
+//line 356  <xsd:element name="SpectrumIdentificationList" type="SpectrumIdentificationListType" maxOccurs="unbounded"/>
             List<SpectrumIdentificationList> silList = analysisData.getSpectrumIdentificationList();
             for (SpectrumIdentificationList sil : silList) {
+//line 645      <xsd:element name="SpectrumIdentificationResult" type="SpectrumIdentificationResultType" maxOccurs="unbounded"/>
                 List<SpectrumIdentificationResult> sirList = sil.getSpectrumIdentificationResult();
-//          1.	For each available SpectrumIdentificationResult (SIR) corresponding to one spectrum 
                 for (SpectrumIdentificationResult sir : sirList) {
-//              a.	Find the raw spectral file by using the location attribute from the SpectraData via the mandatory attribute spectraDataRef
-                    //need to modify the MzIdentMLElement.cgf.xml line 184 autoRefResolving to true for SIR
-                    //otherwise use the statement below
-                    // System.out.println(unmarshaller.getElementAttributes(sir.getSpectraDataRef(),SpectraData.class).get("location"));
-//                        System.out.println(sir.getSpectraData().getLocation());
-//              b.	The spectrum id is retrieved from the mandatory spectrumID attribute
-//                        System.out.println(sir.getSpectrumID());
-//              c.	The id is retrieved from the mandatory id attribute
-//                        System.out.println(sir.getId());
-//              d.	Find the top identification which passes the threshold:
-//                        For each SSI under the current SIR
                     SpectrumIdentificationItem selected = null;
+//line 823          <xsd:element name="SpectrumIdentificationItem" type="SpectrumIdentificationItemType" maxOccurs="unbounded"/>
                     List<SpectrumIdentificationItem> siiList = sir.getSpectrumIdentificationItem();
                     for (SpectrumIdentificationItem sii : siiList) {
-//                  i.	If the mandatory passThreshold attribute is false, jump to the next SSI
-//                  ii.	If the mandatory rank attribute equals to 1, the top SSI is selected, break the loop;
-//                         else jump to next SSI
+//line 793		<xsd:attribute name="rank" type="xsd:int" use="required">
+//line 798		<xsd:attribute name="passThreshold" type="xsd:boolean" use="required">
                         if (sii.isPassThreshold() && sii.getRank() == 1) {
                             selected = sii;
                             break;
                         }
                     }//end of sii list
-//              e.	If the top SSI found 
+//                  If the top SSI found 
                     if (selected != null) {
+                        StringBuilder sb = new StringBuilder();
                         //If the peptide_ref is available (as it is optional)
-                        //change autoRefResolving to true in SII line 139
-                        Peptide peptide = selected.getPeptide();
-                        if (peptide != null) {
-//                      a) retrieve the peptide sequence and modification(s) from the subelement PeptideSequence and Modification respectively from the referenced peptide
-//                                System.out.println(peptide.getPeptideSequence());
-//                                System.out.println("SIR:"+sir.getId()+" peptide: "+peptide.getId());
-                            //currently using the spectral file location from the parameter file, not the getSpectraData.getLocation() assuming the 1-to-1 relationship
-//                                Identification identification = new Identification(sir.getId(), sir.getSpectraData().getLocation(), sir.getSpectrumID(), selected, sir.getCvParam(), identFile); 
-//                      b) for each available PeptideEvidence (PE)
-                            StringBuilder sb = new StringBuilder();
-                            sb.append(peptide.getPeptideSequence());
-                            sb.append("\t>");
+//line 788		<xsd:attribute name="peptide_ref" type="xsd:string">
+                        if (selected.getPeptideRef() != null) {
+                            //PeptideEvidence captures relationship among peptide and protein
+                            //multiple peptide evidences can be caused by one peptide existing in multiple proteins, e.g. isoforms
+//line 760                  <xsd:element name="PeptideEvidenceRef" type="PeptideEvidenceRefType" minOccurs="1" maxOccurs="unbounded"/>
                             List<PeptideEvidenceRef> peRefList = selected.getPeptideEvidenceRef();
+                            StringBuilder proSb = new StringBuilder();
                             for (PeptideEvidenceRef peRef : peRefList) {
-                                //autoResolving set to true in line 325 for PeptideEvidenceRef
-                                PeptideEvidence pe = peRef.getPeptideEvidence();
-//                          i) if isDecoy attribute does not exists or equals to true (does not say if the optional attribute does not exist, which value should be expected), jump to next PE
-                                if (pe.isIsDecoy()) {
-                                    continue;
+                                if (peProtein.containsKey(peRef.getPeptideEvidenceRef())){
+                                    String dbs_id = peProtein.get(peRef.getPeptideEvidenceRef()); 
+                                    proSb.append(accessions.get(dbs_id));
+                                    proSb.append(",");
                                 }
-//                                    foundPE = true;
-//                          ii)retrieve protein id and accession from the mandatory attributes id and accession respectively from the referenced DBSequence in the PE
-                                DBSequence dbs = pe.getDBSequence();
-                                if(dbs_seqs.containsKey(dbs.getId())){
-                                    seqOut.append(">");
-                                    seqOut.append(dbs.getAccession());
-                                    seqOut.append("\n");
-                                    seqOut.append(dbs_seqs.get(dbs.getId()));
-                                    seqOut.append("\n");
-                                    dbs_seqs.remove(dbs.getId());
-                                }
-                                sb.append(dbs.getAccession());
-                                sb.append(",");
                             }
-                            sb.deleteCharAt(sb.length() - 1);
-                            final String pepInfo = sb.toString();
-                            peptides.add(pepInfo);
+                            if(proSb.length()>0){
+                                sb.append(peptideSeqs.get(selected.getPeptideRef()));
+                                sb.append("\t>");
+                                proSb.deleteCharAt(proSb.length() - 1);
+                                sb.append(proSb);
+                                sb.append("\t\t\t");//three tabs between protein, reverse, contaminant, to score
+                            }
+                            //get measurements
                             HashMap<String, String> map = new HashMap<String, String>();
                             for (CvParam cv : selected.getCvParam()) {
                                 if (cv.getCvRef().equals("PSI-MS") || cv.getCvRef().equals("MS")) {
@@ -151,72 +162,63 @@ public class ParseMzid extends Parser {
                                     }
                                 }
                             }
-                            peptideCvTerms.put(pepInfo, map);
+                            if(mainScoreCV.length()==0){//based on the assumption that there is only one setting of used CV terms for SII
+                                //find the main score for output
+                                if (existingTerms.isEmpty()) {
+                                    mainScoreCV = SCORE;
+                                } else if (existingTerms.contains("PSM-level FDRScore")) {
+                                    mainScoreCV = "PSM-level FDRScore";
+                                    existingTerms.remove("PSM-level FDRScore");
+                                } else if (existingTerms.contains("PSM-level combined FDRScore")) {
+                                    mainScoreCV = "PSM-level combined FDRScore";
+                                    existingTerms.remove("PSM-level combined FDRScore");
+                                } else if (existingTerms.contains("Mascot:score")) {
+                                    mainScoreCV = "Mascot:score";
+                                    existingTerms.remove("Mascot:score");
+                                } else {
+                                    mainScoreCV = existingTerms.iterator().next();
+                                    existingTerms.remove(mainScoreCV);
+                                }
+                                remaining.addAll(existingTerms);
+                                out.append("Peptide\tProteins\tReverse\tContaminants\t");
+                                out.append(mainScoreCV);
+                                out.append("\tQuantitation");
+                                for (String one : remaining) {
+                                    out.append("\t");
+                                    out.append(one);
+                                }
+                                out.append("\n");
+                            }
+                            if (mainScoreCV.equals(SCORE)){
+                                sb.append("1");
+                            }else{
+                                if(map.containsKey(mainScoreCV)){
+                                    sb.append(map.get(mainScoreCV));
+                                }else{
+                                    sb.append("1");
+                                }
+                            }
+                            sb.append("\t1");//quantitation always 1 as there is no quant info in mzid
+                            for (String one : remaining) {
+                                sb.append("\t");
+                                if (map.containsKey(one)) {
+                                    sb.append(map.get(one));
+                                } else {
+                                    sb.append("1");
+                                }
+                            }
+                            sb.append("\n");
+                            out.append(sb);
                         }//peptide found
                     }//if sii not null
                 }//end of sir list
             }
-            //find the main score for output
-            String mainScoreCV;
-            if (existingTerms.isEmpty()) {
-                mainScoreCV = SCORE;
-            } else if (existingTerms.contains("PSM-level FDRScore")) {
-                mainScoreCV = "PSM-level FDRScore";
-                existingTerms.remove("PSM-level FDRScore");
-            } else if (existingTerms.contains("PSM-level combined FDRScore")) {
-                mainScoreCV = "PSM-level combined FDRScore";
-                existingTerms.remove("PSM-level combined FDRScore");
-            } else if (existingTerms.contains("Mascot:score")) {
-                mainScoreCV = "Mascot:score";
-                existingTerms.remove("Mascot:score");
-            } else {
-                mainScoreCV = existingTerms.iterator().next();
-                existingTerms.remove(mainScoreCV);
-            }
-            ArrayList<String> remaining = new ArrayList<String>();
-            remaining.addAll(existingTerms);
-            BufferedWriter out = new BufferedWriter(new FileWriter(output));
-            out.append("Peptide\tProteins\tReverse\tContaminants\t");
-            out.append(mainScoreCV);
-            out.append("\tQuantitation");
-            for (String one : remaining) {
-                out.append("\t");
-                out.append(one);
-            }
-            out.append("\n");
-            for (String pepInfo : peptides) {
-                out.append(pepInfo);
-                //reverse contaminant score
-                out.append("\t\t\t");
-                HashMap<String, String> map = peptideCvTerms.get(pepInfo);
-                if (mainScoreCV.equals(SCORE)) {
-                    out.append("1");
-                } else {
-                    if (map.containsKey(mainScoreCV)) {
-                        out.append(map.get(mainScoreCV));
-                    } else {
-                        out.append("1");
-                    }
-                }
-                //quantitation, as there is no quant info, set to be 1
-                out.append("\t1");
-                for (String one : remaining) {
-                    out.append("\t");
-                    if (map.containsKey(one)) {
-                        out.append(map.get(one));
-                    } else {
-                        out.append("1");
-                    }
-                }
-                out.append("\n");
-            }
             out.flush();
             out.close();
-            seqOut.flush();
-            seqOut.close();
         } catch (IOException ex) {
             Logger.getLogger(ParseMzq.class.getName()).log(Level.SEVERE, null, ex);
         }
+        System.out.println("Finish at "+LocalDateTime.now());
     }
 
     /**
